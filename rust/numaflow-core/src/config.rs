@@ -22,7 +22,7 @@ const DEFAULT_CALLBACK_CONCURRENCY: usize = 100;
 /// MonoVertex.
 pub(crate) mod components;
 /// MonoVertex specific configs.
-pub(crate) mod monovertex;
+pub mod monovertex;
 /// Pipeline specific configs.
 pub(crate) mod pipeline;
 

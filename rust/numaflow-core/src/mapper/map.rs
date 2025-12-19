@@ -2,23 +2,24 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use numaflow_pb::clients::map::map_client::MapClient;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
 use tracing::{info, warn};
 
 use crate::config::pipeline::map::MapMode;
 use crate::error;
 use crate::error::Error;
+use crate::mapper::map::transport::MapUdfClient;
 use crate::mapper::map::user_defined::{
     UserDefinedBatchMap, UserDefinedStreamMap, UserDefinedUnaryMap,
 };
 use crate::message::{AckHandle, Message, Offset};
 use crate::tracker::Tracker;
+pub(crate) mod shm_client;
+pub(crate) mod transport;
 pub(super) mod user_defined;
 
 /// UnaryActorMessage is a message that is sent to the UnaryMapperActor.
@@ -135,7 +136,7 @@ pub(crate) struct MapHandle {
     final_result: crate::Result<()>,
     /// The moment we see an error, we will set this to true.
     shutting_down_on_err: bool,
-    health_checker: Option<MapClient<Channel>>,
+    health_checker: Option<Arc<dyn MapUdfClient>>,
 }
 
 /// Response channel size for streaming map.
@@ -145,15 +146,18 @@ impl MapHandle {
     /// Creates a new mapper with the given batch size, concurrency, client, and
     /// tracker handle. It spawns the appropriate actor based on the map
     /// mode.
-    pub(crate) async fn new(
+    pub(crate) async fn new<T: MapUdfClient>(
         map_mode: MapMode,
         batch_size: usize,
         read_timeout: Duration,
         graceful_timeout: Duration,
         concurrency: usize,
-        client: MapClient<Channel>,
+
+        client: T,
         tracker: Tracker,
+        generation_id: u64,
     ) -> error::Result<Self> {
+        let client = Arc::new(client);
         // Based on the map mode, spawn the appropriate map actor
         // and store the sender handle in the actor_sender.
         let actor_sender = match map_mode {
@@ -161,7 +165,7 @@ impl MapHandle {
                 let (sender, receiver) = mpsc::channel(batch_size);
                 let mapper_actor = UnaryMapperActor::new(
                     receiver,
-                    UserDefinedUnaryMap::new(batch_size, client.clone()).await?,
+                    UserDefinedUnaryMap::new(batch_size, client.clone(), generation_id).await?,
                 );
                 tokio::spawn(async move {
                     mapper_actor.run().await;
@@ -172,7 +176,7 @@ impl MapHandle {
                 let (batch_sender, batch_receiver) = mpsc::channel(batch_size);
                 let batch_mapper_actor = BatchMapActor::new(
                     batch_receiver,
-                    UserDefinedBatchMap::new(batch_size, client.clone()).await?,
+                    UserDefinedBatchMap::new(batch_size, client.clone(), generation_id).await?,
                 );
                 tokio::spawn(async move {
                     batch_mapper_actor.run().await;
@@ -183,7 +187,7 @@ impl MapHandle {
                 let (stream_sender, stream_receiver) = mpsc::channel(batch_size);
                 let stream_mapper_actor = StreamMapActor::new(
                     stream_receiver,
-                    UserDefinedStreamMap::new(batch_size, client.clone()).await?,
+                    UserDefinedStreamMap::new(batch_size, client.clone(), generation_id).await?,
                 );
                 tokio::spawn(async move {
                     stream_mapper_actor.run().await;
@@ -423,6 +427,10 @@ impl MapHandle {
 
         // short-lived tokio spawns we don't need structured concurrency here
         tokio::spawn(async move {
+            if read_msg.typ == crate::message::MessageType::Barrier {
+                let _ = output_tx.send(read_msg).await;
+                return;
+            }
             let _permit = permit;
 
             let offset = read_msg.offset.clone();
@@ -460,7 +468,15 @@ impl MapHandle {
                                 .expect("failed to update tracker");
 
                             // send messages downstream
-                            for mapped_message in mapped_messages {
+                            for mut mapped_message in mapped_messages {
+                                // Propagate Partition ID header from input to output
+                                let input_headers = &read_msg.headers;
+                                if let Some(partition_id) = input_headers.get("x-numaflow-partition-id") {
+                                    let mut output_headers = (*mapped_message.headers).clone();
+                                    output_headers.insert("x-numaflow-partition-id".to_string(), partition_id.clone());
+                                    mapped_message.headers = Arc::new(output_headers);
+                                }
+
                                 output_tx
                                     .send(mapped_message)
                                     .await
@@ -514,10 +530,15 @@ impl MapHandle {
         output_tx: mpsc::Sender<Message>,
         tracker: Tracker,
     ) -> error::Result<()> {
+        let (data_msgs, barriers): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|m| m.typ != crate::message::MessageType::Barrier);
+
         let (senders, receivers): (Vec<_>, Vec<_>) =
-            batch.iter().map(|_| oneshot::channel()).unzip();
+            data_msgs.iter().map(|_| oneshot::channel()).unzip();
+
         let msg = BatchActorMessage {
-            messages: batch,
+            messages: data_msgs,
             respond_to: senders,
         };
 
@@ -561,6 +582,10 @@ impl MapHandle {
                 }
             }
         }
+
+        for barrier in barriers {
+            let _ = output_tx.send(barrier).await;
+        }
         Ok(())
     }
 
@@ -583,6 +608,10 @@ impl MapHandle {
     ) {
         let output_tx = output_tx.clone();
         tokio::spawn(async move {
+            if read_msg.typ == crate::message::MessageType::Barrier {
+                let _ = output_tx.send(read_msg).await;
+                return;
+            }
             let _permit = permit;
 
             let (sender, mut receiver) = mpsc::channel(STREAMING_MAP_RESP_CHANNEL_SIZE);
@@ -657,7 +686,7 @@ impl MapHandle {
     // Returns true if the mapper is ready to accept messages.
     pub(crate) async fn ready(&mut self) -> bool {
         if let Some(client) = &mut self.health_checker {
-            match client.is_ready(tonic::Request::new(())).await {
+            match client.wait_until_ready(tonic::Request::new(())).await {
                 Ok(response) => response.into_inner().ready,
                 Err(e) => {
                     error!(?e, "Map Client is not ready");
@@ -730,6 +759,7 @@ mod tests {
             10,
             client,
             tracker.clone(),
+            0,
         )
         .await?;
 
@@ -822,6 +852,7 @@ mod tests {
             10,
             client,
             tracker.clone(),
+            0,
         )
         .await?;
 
@@ -914,6 +945,7 @@ mod tests {
             10,
             client,
             tracker.clone(),
+            0,
         )
         .await?;
 
@@ -1025,6 +1057,7 @@ mod tests {
             10,
             client,
             tracker.clone(),
+            0,
         )
         .await?;
 
@@ -1140,6 +1173,7 @@ mod tests {
             10,
             client,
             tracker.clone(),
+            0,
         )
         .await?;
 
@@ -1265,6 +1299,7 @@ mod tests {
             10,
             client,
             tracker.clone(),
+            0,
         )
         .await?;
 
@@ -1364,6 +1399,7 @@ mod tests {
             10,
             client,
             tracker,
+            0,
         )
         .await?;
 

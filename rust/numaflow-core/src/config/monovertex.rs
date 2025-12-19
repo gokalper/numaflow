@@ -31,7 +31,7 @@ const DEFAULT_GRACEFUL_SHUTDOWN_TIME_SECS: u64 = 20; // time we will wait for UD
 const ENV_NUMAFLOW_GRACEFUL_TIMEOUT_SECS: &str = "NUMAFLOW_GRACEFUL_TIMEOUT_SECS";
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MonovertexConfig {
+pub struct MonovertexConfig {
     pub(crate) name: String,
     pub(crate) batch_size: usize,
     pub(crate) read_timeout: Duration,
@@ -39,7 +39,7 @@ pub(crate) struct MonovertexConfig {
     pub(crate) replica: u16,
     pub(crate) source_config: SourceConfig,
     pub(crate) bypass_condition: Option<ToSinkCondition>,
-    pub(crate) map_config: Option<MapVtxConfig>,
+    pub(crate) map_configs: Vec<MapVtxConfig>,
     pub(crate) sink_config: SinkConfig,
     pub(crate) transformer_config: Option<TransformerConfig>,
     pub(crate) fb_sink_config: Option<SinkConfig>,
@@ -47,6 +47,9 @@ pub(crate) struct MonovertexConfig {
     pub(crate) metrics_config: MetricsConfig,
     pub(crate) callback_config: Option<ServingCallbackConfig>,
     pub(crate) rate_limit: Option<RateLimitConfig>,
+    pub generation_id: u64,
+    /// Enhanced MonoVertex mode (opt-in via annotation)
+    pub enhanced_mode: bool,
 }
 
 impl Default for MonovertexConfig {
@@ -65,7 +68,7 @@ impl Default for MonovertexConfig {
                 sink_type: SinkType::Log(sink::LogConfig::default()),
                 retry_config: None,
             },
-            map_config: None,
+            map_configs: vec![],
             transformer_config: None,
             fb_sink_config: None,
             on_success_sink_config: None,
@@ -73,6 +76,8 @@ impl Default for MonovertexConfig {
             metrics_config: MetricsConfig::default(),
             callback_config: None,
             rate_limit: None,
+            generation_id: 0,
+            enhanced_mode: false,
         }
     }
 }
@@ -172,12 +177,12 @@ impl MonovertexConfig {
             .clone()
             .ok_or_else(|| Error::Config("Map UDF not found".to_string()));
 
-        let map_config = match udf {
-            Ok(udf) => Some(MapVtxConfig {
+        let map_configs = match udf {
+            Ok(udf) => vec![MapVtxConfig {
                 concurrency: batch_size as usize,
                 map_type: udf.try_into()?,
-            }),
-            Err(_) => None,
+            }],
+            Err(_) => vec![],
         };
 
         let fb_sink_config = if sink.fallback.is_some() {
@@ -232,6 +237,20 @@ impl MonovertexConfig {
             });
         }
 
+        let generation_id = env_vars
+            .get("NUMAFLOW_GENERATION_ID")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // Enhanced mode: opt-in via annotation (default false for safety)
+        let enhanced_mode = mono_vertex_obj
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.annotations.as_ref())
+            .and_then(|annotations| annotations.get("numaflow.numaproj.io/enhanced-mode"))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         Ok(MonovertexConfig {
             name: mono_vertex_name,
             replica: *get_vertex_replica(),
@@ -241,13 +260,15 @@ impl MonovertexConfig {
             metrics_config: MetricsConfig::with_lookback_window_in_secs(look_back_window),
             bypass_condition: bypass_condition.and_then(|condition| condition.try_into().ok()),
             source_config,
-            map_config,
+            map_configs,
             sink_config,
             transformer_config,
             fb_sink_config,
             on_success_sink_config,
             callback_config,
             rate_limit,
+            generation_id,
+            enhanced_mode,
         })
     }
 }

@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: monovertex-enhanced
+  labels:
+    app: numaflow
+    monovertex: example
+    enhanced-mode: "true"
+spec:
+  # Init container to ensure UDS directory exists
+  initContainers:
+  - name: setup-uds
+    image: busybox:1.36
+    command: ['sh', '-c', 'mkdir -p /var/run/kafka-reconciler && chmod 777 /var/run/kafka-reconciler']
+    volumeMounts:
+    - name: sidecar-socket
+      mountPath: /var/run/kafka-reconciler
+
+  containers:
+  # Main container: Rust core
+  - name: numaflow-core
+    image: numaflow:latest
+    env:
+    - name: ENHANCED_MODE
+      value: "true"
+    - name: NUMAFLOW_GENERATION_ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.generation
+    - name: KAFKA_BROKER_LIST
+      value: "kafka-broker-1:9092,kafka-broker-2:9092,kafka-broker-3:9092"
+    - name: KAFKA_SIDECAR_SOCKET
+      value: "/var/run/kafka-reconciler/reconciler.sock"
+    
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "2000m"
+    
+    volumeMounts:
+    - name: sidecar-socket
+      mountPath: /var/run/kafka-reconciler
+    - name: state-storage
+      mountPath: /var/numaflow/state
+    
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+
+  # Sidecar: Kafka reconciler
+  - name: kafka-reconciler
+    image: kafka-reconciler-sidecar:v1.0.0
+    env:
+    - name: LISTEN_ADDR
+      value: "unix:///var/run/kafka-reconciler/reconciler.sock"
+    - name: HEALTH_PORT
+      value: "8081"
+    - name: LOG_LEVEL
+      value: "info"
+    
+    # CRITICAL: Resource limits to prevent memory leaks affecting primary
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+      limits:
+        # Hard limit: 64Mi ensures any leak is contained
+        memory: "64Mi"
+        cpu: "100m"
+    
+    volumeMounts:
+    - name: sidecar-socket
+      mountPath: /var/run/kafka-reconciler
+    
+    # Health checks for sidecar
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8081
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: 8081
+      initialDelaySeconds: 2
+      periodSeconds: 5
+      failureThreshold: 2
+    
+    # Startup probe ensures sidecar is ready before Rust core connects
+    startupProbe:
+      httpGet:
+        path: /readyz
+        port: 8081
+      initialDelaySeconds: 0
+      periodSeconds: 1
+      failureThreshold: 30  # 30 seconds max startup time
+
+  volumes:
+  # Shared volume for UDS communication
+  - name: sidecar-socket
+    emptyDir:
+      medium: Memory  # Use tmpfs for faster UDS
+      sizeLimit: "1Mi"
+  
+  # Persistent state storage for Rust core
+  - name: state-storage
+    persistentVolumeClaim:
+      claimName: monovertex-state-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monovertex-enhanced-service
+spec:
+  selector:
+    app: numaflow
+    monovertex: example
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: sidecar-health
+    port: 8081
+    targetPort: 8081

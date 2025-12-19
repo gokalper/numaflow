@@ -24,7 +24,7 @@ pub(crate) use crate::error::{Error, Result};
 pub mod monovertex;
 
 /// Parse configs, including Numaflow specifications.
-mod config;
+pub mod config;
 
 /// Internal message structure that is passed around.
 mod message;
@@ -70,6 +70,9 @@ mod mapper;
 /// [Watermark]: https://numaflow.numaproj.io/core-concepts/watermarks/
 mod watermark;
 
+/// Phase 4: MonoVertex watermark management (per-partition tracking, idle detection)
+mod monovertex_watermark;
+
 /// Type configuration trait for Numaflow components.
 pub(crate) mod typ;
 
@@ -78,6 +81,49 @@ pub(crate) mod typ;
 ///
 /// [Reduce]:https://numaflow.numaproj.io/user-guide/user-defined-functions/reduce/reduce/
 mod reduce;
+
+/// Phase 2: Root of Truth - Commit Record
+pub mod commit_record;
+
+/// Phase 2: State Storage Layer
+pub mod state;
+
+/// Phase 2: Epoch Boundary Coordinator
+pub mod epoch;
+
+/// Phase 2: Reconciliation (Crash-After-Visible Recovery)
+mod reconcile;
+
+/// Phase 2: Recovery Bootstrap
+pub mod recovery;
+
+/// Phase 2: SEAL Coordinator (drain in-flight messages)
+pub mod seal;
+
+/// Phase 2: Metrics (mandatory observability)
+mod phase2_metrics;
+
+/// Phase 2: Remote Commit Store (S3 backup)
+pub mod remote_store;
+
+/// Phase 3B: Kafka reconciler sidecar client
+pub mod kafka_sidecar_client;
+
+/// Phase 3: State Layout (hot/warm caching)
+pub mod state_layout;
+
+/// Phase 3: Dirty Index (incremental checkpointing)
+pub mod dirty_index;
+
+/// Phase 3: Epoch Output Buffer (buffered outputs)
+pub mod epoch_buffer;
+
+/// Phase 3: Flush Policy (flush triggers)
+pub mod flush_policy;
+
+#[cfg(test)]
+#[path = "state_epoch_tests.rs"]
+mod state_epoch_tests;
 
 pub async fn run() -> Result<()> {
     let cln_token = CancellationToken::new();

@@ -37,3 +37,6 @@ target/
 
 .qodo
 .venv
+poc/
+.agent/
+aidocs/

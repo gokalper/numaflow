@@ -77,10 +77,27 @@ pub enum Error {
     #[error("WAL Error - {0}")]
     #[allow(clippy::upper_case_acronyms)]
     WAL(String),
+
+    #[error("Shared Memory Error - {0}")]
+    SharedMemory(String),
+    
+    /// Phase 3: Backpressure signal (memory limits exceeded)
+    #[error("Backpressure - {0}")]
+    Backpressure(String),
+    
+    /// Phase 4: Generation mismatch (zombie pod detected)
+    #[error("Generation mismatch - expected {expected}, got {got}")]
+    GenerationMismatch { expected: u64, got: u64 },
 }
 
 impl From<numaflow_shared::error::Error> for Error {
     fn from(value: numaflow_shared::error::Error) -> Self {
         Error::Shared(value)
+    }
+}
+
+impl From<rocksdb::Error> for Error {
+    fn from(value: rocksdb::Error) -> Self {
+        Error::Config(format!("RocksDB error: {}", value))
     }
 }
