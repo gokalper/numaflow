@@ -252,6 +252,8 @@ async fn run_all_map_forwarders<C: NumaflowTypeConfig>(
             map_vtx_config.clone(),
             context.tracker.clone(),
             context.cln_token.clone(),
+            context.config.generation_id,
+            false, // enhanced_mode: Pipeline doesn't support enhanced MonoVertex features
         )
         .await?;
 

@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package reconciler.v1;
+
+option go_package = "github.com/numaproj/numaflow/kafka-reconciler-sidecar/api/reconciler/v1;reconcilerv1";
+
+// KafkaReconciler provides Kafka Admin API for transaction reconciliation
+service KafkaReconciler {
+  // Describe transaction state via Kafka Admin API
+  rpc DescribeTransaction(DescribeTransactionRequest) returns (DescribeTransactionResponse);
+  
+  // Abort an ongoing transaction
+  rpc AbortTransaction(AbortTransactionRequest) returns (AbortTransactionResponse);
+  
+  // List consumer group offsets for alignment verification
+  rpc ListConsumerGroupOffsets(ListConsumerGroupOffsetsRequest) returns (ListConsumerGroupOffsetsResponse);
+  
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message DescribeTransactionRequest {
+  string broker_list = 1;       // "broker1:9092,broker2 9092"
+  string transactional_id = 2;  // "numaflow-gen1-epoch42"
+  int32 timeout_ms = 3;         // 10000 (10s)
+}
+
+message DescribeTransactionResponse {
+  TransactionState state = 1;
+  string error = 2;             // Non-empty if request failed
+}
+
+enum TransactionState {
+  TRANSACTION_STATE_UNKNOWN = 0;
+  TRANSACTION_STATE_COMMITTED = 1;
+  TRANSACTION_STATE_ABORTED = 2;
+  TRANSACTION_STATE_ONGOING = 3;
+  TRANSACTION_STATE_PREPARE_COMMIT = 4;
+  TRANSACTION_STATE_PREPARE_ABORT = 5;
+}
+
+message AbortTransactionRequest {
+  string broker_list = 1;
+  string transactional_id = 2;
+  int32 producer_epoch = 3;
+  int32 timeout_ms = 4;
+}
+
+message AbortTransactionResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ListConsumerGroupOffsetsRequest {
+  string broker_list = 1;
+  string consumer_group = 2;
+  repeated string topics = 3;
+  int32 timeout_ms = 4;
+}
+
+message ListConsumerGroupOffsetsResponse {
+  map<string, int64> partition_offsets = 1;  // "topic-partition" -> offset
+  string error = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+  int64 uptime_seconds = 3;
+}
